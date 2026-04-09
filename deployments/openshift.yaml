@@ -1,0 +1,106 @@
+---
+# Secret for Consul token
+apiVersion: v1
+kind: Secret
+metadata:
+  name: consul-kv-proxy-token
+  namespace: consul
+type: Opaque
+stringData:
+  token: "7c0f9543-fa8b-d21a-c1f2-971291c46f8b" # Replace with your token
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consul-kv-proxy
+  namespace: consul
+  labels:
+    app: consul-kv-proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: consul-kv-proxy
+  template:
+    metadata:
+      labels:
+        app: consul-kv-proxy
+      annotations:
+        consul.hashicorp.com/connect-inject: "false"
+    spec:
+      containers:
+        - name: consul-kv-proxy
+          image: clovett07/consul-kv-proxy:latest # Replace with your image
+          ports:
+            - containerPort: 8080
+          env:
+            - name: CONSUL_HTTP_ADDR
+              value: "https://consul-server.consul.svc.cluster.local:8501"
+            - name: CONSUL_HTTP_SSL_VERIFY
+              value: "false"
+            - name: PROXY_LISTEN_ADDR
+              value: ":8080"
+            - name: CONSUL_HTTP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: consul-kv-proxy-token
+                  key: token
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "128Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+      # OpenShift: run as non-root
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: consul-kv-proxy
+  namespace: consul
+  labels:
+    app: consul-kv-proxy
+spec:
+  selector:
+    app: consul-kv-proxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
+
+---
+# Route (OpenShift-specific — exposes the proxy externally if needed)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: consul-kv-proxy
+  namespace: consul
+spec:
+  to:
+    kind: Service
+    name: consul-kv-proxy
+  port:
+    targetPort: http
+  tls:
+    termination: edge
