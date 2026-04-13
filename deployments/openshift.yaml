@@ -1,5 +1,5 @@
 ---
-# Secret for Consul token
+# Secret for Consul token (optional fallback token; omit if PROXY_REQUIRE_CALLER_TOKEN=true)
 apiVersion: v1
 kind: Secret
 metadata:
@@ -7,7 +7,7 @@ metadata:
   namespace: consul
 type: Opaque
 stringData:
-  token: "7c0f9543-fa8b-d21a-c1f2-971291c46f8b" # Replace with your token
+  token: "7c0f9543-fa8b-d21a-c1f2-971291c46f8b" # Replace with your fallback token, or delete this Secret if not needed
 
 ---
 # Deployment
@@ -42,11 +42,20 @@ spec:
               value: "false"
             - name: PROXY_LISTEN_ADDR
               value: ":8080"
+            # PROXY_REQUIRE_CALLER_TOKEN: when "true", requests that do not include
+            # X-Consul-Token are rejected with 401. Set to "true" to enforce per-user
+            # authorization. When "false" (the default), the fallback CONSUL_HTTP_TOKEN
+            # is used for requests without a caller-supplied token.
+            - name: PROXY_REQUIRE_CALLER_TOKEN
+              value: "false"
+            # CONSUL_HTTP_TOKEN: optional fallback token used when the caller does not
+            # supply X-Consul-Token. Not required when PROXY_REQUIRE_CALLER_TOKEN=true.
             - name: CONSUL_HTTP_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: consul-kv-proxy-token
                   key: token
+                  optional: true
           resources:
             requests:
               cpu: "100m"

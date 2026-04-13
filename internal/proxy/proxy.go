@@ -18,10 +18,11 @@ import (
 
 // Config holds proxy configuration.
 type Config struct {
-	ConsulAddr    string
-	ConsulToken   string
-	TLSSkipVerify bool
-	Rules         *rules.RuleSet
+	ConsulAddr         string
+	ConsulToken        string // Fallback token when the caller does not supply X-Consul-Token.
+	RequireCallerToken bool   // If true, reject requests that do not include X-Consul-Token.
+	TLSSkipVerify      bool
+	Rules              *rules.RuleSet
 }
 
 // Proxy is an HTTP handler that intercepts Consul KV writes.
@@ -52,8 +53,12 @@ func New(cfg Config) *Proxy {
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
 		req.Host = target.Host
-		// Inject Consul token
-		req.Header.Set("X-Consul-Token", cfg.ConsulToken)
+		// Token forwarding: preserve the caller's X-Consul-Token when present;
+		// fall back to the proxy's configured token only when the caller omits it.
+		if req.Header.Get("X-Consul-Token") == "" && cfg.ConsulToken != "" {
+			req.Header.Set("X-Consul-Token", cfg.ConsulToken)
+		}
+		// X-Consul-Namespace is forwarded from the caller unchanged.
 	}
 
 	return &Proxy{
@@ -75,17 +80,36 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Determine auth source for observability (never log the token value itself).
+	callerToken := r.Header.Get("X-Consul-Token")
+	namespace := r.Header.Get("X-Consul-Namespace")
+	authSource := "caller"
+	if callerToken == "" {
+		if p.config.RequireCallerToken {
+			writeError(w, http.StatusUnauthorized, "X-Consul-Token header is required")
+			log.Printf("[REJECTED] %s %s auth=missing-required-token ns=%q elapsed=%v",
+				r.Method, r.URL.Path, namespace, time.Since(start))
+			return
+		}
+		if p.config.ConsulToken != "" {
+			authSource = "fallback"
+		} else {
+			authSource = "none"
+		}
+	}
+
 	// Only intercept KV PUT/DELETE writes
 	isKVWrite := strings.HasPrefix(r.URL.Path, "/v1/kv/") && r.Method == http.MethodPut
 
 	if isKVWrite {
 		if err := p.enforceRules(w, r); err != nil {
-			log.Printf("[REJECTED] %s %s (%v) reason=%s", r.Method, r.URL.Path, time.Since(start), err.Error())
+			log.Printf("[REJECTED] %s %s auth=%s ns=%q reason=%s elapsed=%v",
+				r.Method, r.URL.Path, authSource, namespace, err.Error(), time.Since(start))
 			return
 		}
 	}
 
-	log.Printf("[FORWARD] %s %s", r.Method, r.URL.Path)
+	log.Printf("[FORWARD] %s %s auth=%s ns=%q", r.Method, r.URL.Path, authSource, namespace)
 	p.reverseP.ServeHTTP(w, r)
 }
 
