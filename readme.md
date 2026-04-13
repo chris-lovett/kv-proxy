@@ -67,9 +67,27 @@ App → consul-kv-proxy (listen addr, default :8080) → Consul HTTP API (defaul
 | Variable | Default | Required | Description |
 |---|---:|:---:|---|
 | `CONSUL_HTTP_ADDR` | `https://127.0.0.1:8501` |  | Consul backend address (the proxy forwards to this). |
-| `CONSUL_HTTP_TOKEN` | *(none)* | **Yes** | Consul ACL token used by the proxy when calling Consul. |
+| `CONSUL_HTTP_TOKEN` | *(none)* |  | Fallback Consul ACL token used **only** when the caller does not supply `X-Consul-Token`. No longer required; omit it when `PROXY_REQUIRE_CALLER_TOKEN=true`. |
+| `PROXY_REQUIRE_CALLER_TOKEN` | `false` |  | When `true`, requests without a caller-supplied `X-Consul-Token` header are rejected with **401 Unauthorized**. When `false`, the proxy falls back to `CONSUL_HTTP_TOKEN` (if set) for unauthenticated requests. |
 | `CONSUL_HTTP_SSL_VERIFY` | `true` |  | If set to `false`, the proxy will **skip TLS certificate verification** when talking to Consul (useful for demos/self-signed certs). |
 | `PROXY_LISTEN_ADDR` | `:8080` |  | Address/port the proxy listens on. |
+
+## Authorization behavior
+
+The proxy now performs **per-caller authorization** instead of always using a shared proxy token:
+
+1. **Caller token present** (`X-Consul-Token` header set by the caller):  
+   The header is forwarded to Consul **unchanged**. Consul ACL enforcement is applied using the caller's own token, enabling per-user / per-namespace access control.
+
+2. **Caller token absent — fallback mode** (`PROXY_REQUIRE_CALLER_TOKEN=false`, default):  
+   If `CONSUL_HTTP_TOKEN` is configured, it is used as a fallback token for unauthenticated callers. If neither is set, the request is forwarded without an auth token (Consul will evaluate it against the default ACL policy).
+
+3. **Caller token absent — strict mode** (`PROXY_REQUIRE_CALLER_TOKEN=true`):  
+   The proxy immediately rejects the request with **401 Unauthorized** and logs the rejection. No request reaches Consul without a caller-supplied token.
+
+The `X-Consul-Namespace` header is always forwarded from the caller unchanged, enabling per-namespace routing without any proxy-side hardcoding.
+
+**Observability**: every forwarded request is logged with method, path, auth source (`caller` / `fallback` / `none`), and namespace (if present). Token values are **never logged**.
 
 ## Running locally
 
@@ -83,7 +101,12 @@ App → consul-kv-proxy (listen addr, default :8080) → Consul HTTP API (defaul
 
 ```bash
 export CONSUL_HTTP_ADDR="https://<your-consul-host>:8501"
-export CONSUL_HTTP_TOKEN="<your-consul-acl-token>"
+
+# Mode A: forward each caller's own X-Consul-Token (require it; no fallback)
+export PROXY_REQUIRE_CALLER_TOKEN=true
+
+# Mode B: use a fallback proxy token when the caller doesn't supply one
+# export CONSUL_HTTP_TOKEN="<your-fallback-consul-acl-token>"
 
 # Optional: for demos with self-signed certs ONLY
 # export CONSUL_HTTP_SSL_VERIFY=false
@@ -97,7 +120,7 @@ go run ./cmd/proxy
 You should see a log similar to:
 
 ```text
-Consul KV Proxy listening on :8080 -> https://<your-consul-host>:8501
+Consul KV Proxy listening on :8080 -> https://<your-consul-host>:8501 (require-caller-token=true)
 ```
 
 ## Build and run as a container
@@ -152,7 +175,16 @@ At that point, any client using Consul’s HTTP API for KV operations will go th
 
 ## Testing
 
-### Write a safe value (should pass)
+### Write a safe value with a caller token (should pass)
+
+```bash
+curl -i -X PUT "http://localhost:8080/v1/kv/test/safe" \
+  -H "X-Consul-Token: $CONSUL_HTTP_TOKEN" \
+  -H "X-Consul-Namespace: ait-123" \
+  -d "hello-world"
+```
+
+### Attempt to write without a token when PROXY_REQUIRE_CALLER_TOKEN=true (should return 401)
 
 ```bash
 curl -i -X PUT "http://localhost:8080/v1/kv/test/safe" -d "hello-world"
@@ -162,6 +194,7 @@ curl -i -X PUT "http://localhost:8080/v1/kv/test/safe" -d "hello-world"
 
 ```bash
 curl -i -X PUT "http://localhost:8080/v1/kv/test/toobig" \
+  -H "X-Consul-Token: $CONSUL_HTTP_TOKEN" \
   -d "$(head -c 200000 /dev/urandom | base64)"
 ```
 
@@ -171,6 +204,7 @@ AWS access key example:
 
 ```bash
 curl -i -X PUT "http://localhost:8080/v1/kv/test/awskey" \
+  -H "X-Consul-Token: $CONSUL_HTTP_TOKEN" \
   -d "AKIAIOSFODNN7EXAMPLE"
 ```
 
@@ -178,13 +212,15 @@ Password example:
 
 ```bash
 curl -i -X PUT "http://localhost:8080/v1/kv/test/creds" \
+  -H "X-Consul-Token: $CONSUL_HTTP_TOKEN" \
   -d "password=supersecret123"
 ```
 
 ## Security and operational notes
 
-- **The proxy requires a Consul ACL token** (`CONSUL_HTTP_TOKEN`) and uses it to communicate with Consul.
-  - Choose a token with the minimum privileges required for the KV operations you expect.
+- **Per-caller authorization**: by default the proxy forwards each request using the caller’s own `X-Consul-Token`. Set `PROXY_REQUIRE_CALLER_TOKEN=true` to enforce that every request includes a caller token; omit it (default `false`) to allow the proxy’s fallback `CONSUL_HTTP_TOKEN` for unauthenticated callers.
+- **`CONSUL_HTTP_TOKEN` is now optional** — it acts as a fallback only. If you set `PROXY_REQUIRE_CALLER_TOKEN=true` you do not need to supply it.
+- **No secrets are logged** — the proxy logs which auth source was used (`caller` / `fallback` / `none`) but never the token value itself.
 - If you set `CONSUL_HTTP_SSL_VERIFY=false`, TLS verification is disabled between the proxy and Consul. This is convenient for demos but **not recommended** for production.
 - This project is intentionally small and focused; it’s a good starting point for adding additional write-time policy checks.
 

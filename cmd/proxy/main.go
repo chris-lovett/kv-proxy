@@ -14,9 +14,11 @@ func main() {
 	consulToken := getEnv("CONSUL_HTTP_TOKEN", "")
 	listenAddr := getEnv("PROXY_LISTEN_ADDR", ":8080")
 	tlsSkipVerify := getEnv("CONSUL_HTTP_SSL_VERIFY", "true") == "false"
+	requireCallerToken := getEnv("PROXY_REQUIRE_CALLER_TOKEN", "false") == "true"
 
-	if consulToken == "" {
-		log.Fatal("CONSUL_HTTP_TOKEN must be set")
+	if consulToken == "" && !requireCallerToken {
+		log.Println("WARNING: CONSUL_HTTP_TOKEN is not set and PROXY_REQUIRE_CALLER_TOKEN is false; " +
+			"requests without a caller-supplied X-Consul-Token will be forwarded unauthenticated")
 	}
 
 	ruleSet := rules.NewRuleSet(
@@ -25,13 +27,14 @@ func main() {
 	)
 
 	p := proxy.New(proxy.Config{
-		ConsulAddr:    consulAddr,
-		ConsulToken:   consulToken,
-		TLSSkipVerify: tlsSkipVerify,
-		Rules:         ruleSet,
+		ConsulAddr:         consulAddr,
+		ConsulToken:        consulToken,
+		RequireCallerToken: requireCallerToken,
+		TLSSkipVerify:      tlsSkipVerify,
+		Rules:              ruleSet,
 	})
 
-	log.Printf("Consul KV Proxy listening on %s -> %s", listenAddr, consulAddr)
+	log.Printf("Consul KV Proxy listening on %s -> %s (require-caller-token=%v)", listenAddr, consulAddr, requireCallerToken)
 	if err := http.ListenAndServe(listenAddr, p); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
